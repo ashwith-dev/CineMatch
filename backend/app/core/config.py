@@ -6,9 +6,7 @@ from pathlib import Path
 env_path = Path(__file__).resolve().parent.parent.parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    raise ValueError("DATABASE_URL is not set in .env file")
+DATABASE_URL = os.getenv("DATABASE_URL", "")  # Optional — only needed for user auth features
 
 # Expose all other keys so importing this module triggers .env load
 TMDB_API_KEY    = os.getenv("TMDB_API_KEY", "")
