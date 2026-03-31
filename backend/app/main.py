@@ -20,17 +20,12 @@ app = FastAPI(
     version="0.1.0",
 )
 
-ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "https://*.vercel.app",
-    os.getenv("FRONTEND_URL", ""),
-]
-
+# CORS — allow all origins (no credentials needed for this public API)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[o for o in ALLOWED_ORIGINS if o],
-    allow_credentials=True,
-    allow_methods=["*"],
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
