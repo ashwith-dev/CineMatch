@@ -46,11 +46,18 @@ GENRE_NAME_TO_ID: dict = {
 }
 
 LANGUAGE_NAME_TO_CODE: dict = {
+    # English names
     "english": "en", "hindi": "hi", "telugu": "te", "tamil": "ta",
     "kannada": "kn", "malayalam": "ml", "bengali": "bn", "marathi": "mr",
     "punjabi": "pa", "french": "fr", "spanish": "es", "german": "de",
     "japanese": "ja", "korean": "ko", "chinese": "zh", "italian": "it",
     "portuguese": "pt", "russian": "ru", "arabic": "ar", "turkish": "tr",
+    # Native script names (fallback if AI returns in native language)
+    "తెలుగు": "te", "हिंदी": "hi", "தமிழ்": "ta", "മലയാളം": "ml",
+    "ಕನ್ನಡ": "kn", "বাংলা": "bn", "मराठी": "mr", "ਪੰਜਾਬੀ": "pa",
+    "français": "fr", "español": "es", "deutsch": "de", "日本語": "ja",
+    "한국어": "ko", "中文": "zh", "italiano": "it", "português": "pt",
+    "русский": "ru", "عربي": "ar", "türkçe": "tr",
 }
 
 # Languages whose films are commonly dubbed into the key language

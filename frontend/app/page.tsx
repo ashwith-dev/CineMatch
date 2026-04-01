@@ -84,9 +84,14 @@ const ALL_LANGUAGES = [
 ]
 
 const LANG_NAME_TO_CODE: Record<string, string> = {
+  // English names
   telugu: 'te', tamil: 'ta', hindi: 'hi', malayalam: 'ml',
   kannada: 'kn', english: 'en', korean: 'ko', japanese: 'ja',
   french: 'fr', spanish: 'es', german: 'de', chinese: 'zh',
+  // Native script names
+  'తెలుగు': 'te', 'हिंदी': 'hi', 'தமிழ்': 'ta', 'മലയാളം': 'ml',
+  'ಕನ್ನಡ': 'kn', '한국어': 'ko', '日本語': 'ja', '中文': 'zh',
+  'français': 'fr', 'español': 'es', 'deutsch': 'de',
 }
 
 const TMDB_GENRE_MAP: Record<number, string> = {
