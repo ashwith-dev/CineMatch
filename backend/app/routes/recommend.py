@@ -388,32 +388,45 @@ async def recommend(
         if filters.get("cast") or filters.get("director"):
             params = await _apply_cast_director_filter(filters, params)
 
-        # ── Genres ────────────────────────────────────────────────────────
-        # "movies like Dhurandhar in Telugu":
-        #   1. Look up Dhurandhar → get genre_ids [28, 53, 80] (action, thriller, crime)
-        #   2. Use those as OR genre filter
-        #   3. Language handled separately below (Telugu originals + dubbed)
-        explicit_ids = _explicit_genre_ids(filters)
-        mood_ids     = _mood_genre_ids(filters)
+        # ── Direct movie title search ─────────────────────────────────────
+        # When user types a movie title (e.g. "Hari Hara Veera Mallu"),
+        # search TMDB for exact match, pin it at top, then show similar movies below
+        direct_search = filters.get("direct_search")
+        exact_movie: Optional[dict] = None
 
-        if "similar_to" in filters:
-            ref_genre_ids, _ref_lang = await _resolve_reference_movie(filters["similar_to"])
-            if explicit_ids:
-                # User gave explicit genres too → use those
-                params["with_genres"] = _build_genre_param(explicit_ids, use_and=False)
-            elif ref_genre_ids:
-                # Use genres from the reference film (OR — any matching genre)
-                params["with_genres"] = _build_genre_param(ref_genre_ids, use_and=False)
-        else:
-            if explicit_ids:
-                params["with_genres"] = _build_genre_param(explicit_ids, use_and=False)
-            elif mood_ids:
-                params["with_genres"] = _build_genre_param(mood_ids, use_and=False)
+        if direct_search:
+            try:
+                search_data    = await _tmdb_get("/search/movie", {
+                    "query": direct_search, "language": "en-US", "page": 1,
+                })
+                search_results = search_data.get("results", [])
+                if search_results:
+                    exact_movie    = search_results[0]
+                    ref_genre_ids  = exact_movie.get("genre_ids", [])
+                    if ref_genre_ids:
+                        params["with_genres"] = _build_genre_param(ref_genre_ids, use_and=False)
+                    logger.info("[recommend] Direct match: %s (id=%s)",
+                                exact_movie.get("title"), exact_movie.get("id"))
+            except Exception as exc:
+                logger.warning("[recommend] Direct search error: %s", exc)
+
+        # ── Genres (non-direct searches) ───────────────────────────────
+        if not direct_search:
+            explicit_ids = _explicit_genre_ids(filters)
+            mood_ids     = _mood_genre_ids(filters)
+            if "similar_to" in filters:
+                ref_genre_ids, _ref_lang = await _resolve_reference_movie(filters["similar_to"])
+                if explicit_ids:
+                    params["with_genres"] = _build_genre_param(explicit_ids, use_and=False)
+                elif ref_genre_ids:
+                    params["with_genres"] = _build_genre_param(ref_genre_ids, use_and=False)
+            else:
+                if explicit_ids:
+                    params["with_genres"] = _build_genre_param(explicit_ids, use_and=False)
+                elif mood_ids:
+                    params["with_genres"] = _build_genre_param(mood_ids, use_and=False)
 
         # ── Language (always last, always wins) ───────────────────────────
-        # "in Telugu" → dual fetch: Telugu originals + Tamil/Hindi/etc dubbed into Telugu
-        # "dubbed"    → same dual fetch (default Telugu)
-        # No language → single TMDB call, no language filter
         explicit_lang    = _language_code(filters)
         dubbed_requested = filters.get("dubbed", False)
 
@@ -436,7 +449,14 @@ async def recommend(
     raw_results   = tmdb_data.get("results", [])
     total_results = tmdb_data.get("total_results", len(raw_results))
     total_pages   = tmdb_data.get("total_pages", 1)
-    movies        = [_format_movie(r, genre_map) for r in raw_results]
+
+    # Pin exact movie at top, remove it from discover results to avoid duplicate
+    if exact_movie:
+        exact_id  = exact_movie["id"]
+        raw_results = [r for r in raw_results if r["id"] != exact_id]
+        raw_results = [exact_movie] + raw_results  # exact match first!
+
+    movies = [_format_movie(r, genre_map) for r in raw_results]
 
     # Local post-filter (belt-and-suspenders)
     min_rating = filters.get("min_rating")

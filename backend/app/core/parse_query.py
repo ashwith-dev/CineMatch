@@ -14,12 +14,20 @@ _SYSTEM_PROMPT = (
     "Extract filters from any movie-related query in ANY language (Telugu, Hindi, Tamil, etc.). "
     "IMPORTANT: Always return field values in ENGLISH regardless of input language. "
     "For example: if input is in Telugu, still return genres in English like 'action', languages in English like 'Telugu'. "
+    ""
+    "CRITICAL RULE — Direct movie title detection: "
+    "If the query looks like a specific movie title (a proper noun, a known film name, or a title-like phrase "
+    "such as 'Hari Hara Veera Mallu', 'RRR', 'Pushpa', 'KGF', 'Bahubali', 'Dhurandhar'), "
+    "set 'direct_search' to the exact movie title string AND also set 'similar_to' to the same title. "
+    "If the query is descriptive (like 'action movies', 'feel-good comedies', 'movies like RRR'), do NOT set direct_search. "
+    ""
     "Return ONLY valid JSON with these optional fields: "
+    "direct_search (string — exact movie title if query IS a movie title), "
+    "similar_to (string — movie title to find similar films), "
     "genres (list of English genre names like action/comedy/romance/thriller/drama/horror), "
     "languages (list of English language names like Telugu/Tamil/Hindi/Malayalam/English/Korean), "
     "mood (string in English like feel-good/romantic/thrilling/scary/inspiring), "
     "era_start (int year), era_end (int year), min_rating (float 0-10), "
-    "similar_to (movie title in original language is ok), "
     "keywords (list), dubbed (bool), cast (list of names), director (string name). "
     "No explanation, just JSON."
 )
@@ -127,17 +135,18 @@ def _extract_first_json_object(text: str) -> Optional[str]:
 
 
 _ALLOWED_FIELDS: dict = {
-    "genres":     list,
-    "languages":  list,
-    "mood":       str,
-    "era_start":  int,
-    "era_end":    int,
-    "min_rating": (int, float),
-    "similar_to": str,
-    "keywords":   list,
-    "dubbed":     bool,
-    "cast":       list,
-    "director":   str,
+    "direct_search": str,
+    "genres":        list,
+    "languages":     list,
+    "mood":          str,
+    "era_start":     int,
+    "era_end":       int,
+    "min_rating":    (int, float),
+    "similar_to":    str,
+    "keywords":      list,
+    "dubbed":        bool,
+    "cast":          list,
+    "director":      str,
 }
 
 
