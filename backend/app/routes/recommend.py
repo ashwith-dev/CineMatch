@@ -2,12 +2,24 @@
 app/routes/recommend.py
 GET /recommend?q=<query>&page=<page>&sort=<sort>
 
-Language logic:
-  When user says "in Telugu" (or any language), we do TWO TMDB fetches:
-    1. Telugu originals with genre filter
-    2. Tamil + Hindi + Malayalam + Kannada films with same genre filter
-       (these are commonly dubbed into Telugu)
-  Results are merged and deduplicated — so user gets both originals AND dubbed.
+Search Algorithm (3 modes):
+
+MODE 1 — TITLE SEARCH (e.g. "Kushi", "Hari Hara Veera Mallu")
+  Step 1: /search/movie?query=title → get ALL matching movies across languages
+  Step 2: /discover/movie?with_text_query=title&with_original_language=lang → language-filtered
+  Step 3: Score each result: exact title match > partial match > others
+  Step 4: Merge both lists, deduplicate, sort by score then by release_date desc
+  Result: Exact Telugu Kushi (2023) first, then 2001 Kushi, then similar movies
+
+MODE 2 — SIMILAR MOVIES (e.g. "movies like RRR", "like Dhurandhar in Telugu")
+  Step 1: Look up reference movie on TMDB → get genre_ids
+  Step 2: /discover with those genre_ids + language filter (dual fetch for dubbed)
+  Result: Movies with matching genres in target language
+
+MODE 3 — DESCRIPTIVE (e.g. "feel-good romantic comedies", "90s horror")
+  Step 1: Extract genre/language/mood/era from AI
+  Step 2: /discover with all filters
+  Result: Genre/mood/era filtered movies
 """
 
 from __future__ import annotations
@@ -16,6 +28,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 from datetime import date
 from typing import Any, Optional
 
@@ -52,7 +65,7 @@ LANGUAGE_NAME_TO_CODE: dict = {
     "punjabi": "pa", "french": "fr", "spanish": "es", "german": "de",
     "japanese": "ja", "korean": "ko", "chinese": "zh", "italian": "it",
     "portuguese": "pt", "russian": "ru", "arabic": "ar", "turkish": "tr",
-    # Native script names (fallback if AI returns in native language)
+    # Native script names
     "తెలుగు": "te", "हिंदी": "hi", "தமிழ்": "ta", "മലയാളം": "ml",
     "ಕನ್ನಡ": "kn", "বাংলা": "bn", "मराठी": "mr", "ਪੰਜਾਬੀ": "pa",
     "français": "fr", "español": "es", "deutsch": "de", "日本語": "ja",
@@ -203,89 +216,6 @@ async def _fetch_person_id(name: str) -> Optional[int]:
         return None
 
 
-async def _resolve_reference_movie(title: str) -> tuple:
-    """
-    Search TMDB for the reference film.
-    Returns (genre_ids, original_language).
-    Language from the reference is returned raw — the caller decides whether
-    to use it or override with the user's explicit language preference.
-    """
-    try:
-        data = await _tmdb_get("/search/movie", {"query": title, "language": "en-US"})
-        results = data.get("results", [])
-        if not results:
-            logger.warning("[resolve_ref] No TMDB results for %r", title)
-            return [], None
-        ref = results[0]
-        ref_genre_ids = ref.get("genre_ids", [])
-        ref_lang      = ref.get("original_language", "")
-        logger.info("[resolve_ref] %r → genres=%s lang=%s", title, ref_genre_ids, ref_lang)
-        return ref_genre_ids, ref_lang
-    except Exception as exc:
-        logger.warning("[resolve_ref] Failed for %r: %s", title, exc)
-        return [], None
-
-
-async def _fetch_with_language(base_params: dict, user_lang: str) -> dict:
-    """
-    Execute TWO TMDB discover calls for a given language and merge results:
-      Call 1 — original language = user_lang (e.g. Telugu originals)
-      Call 2 — source languages commonly dubbed into user_lang
-               (e.g. Tamil/Hindi/Malayalam for Telugu)
-
-    This ensures "movies like Dhurandhar in Telugu" returns:
-      - Telugu-original action/thriller/crime films
-      - Tamil/Hindi action/thriller/crime films that are dubbed in Telugu
-
-    Results are deduplicated by movie id, then re-sorted.
-    """
-    # Call 1: originals in user language
-    params1  = {**base_params, "with_original_language": user_lang}
-    data1    = await _tmdb_get("/discover/movie", params1)
-    results1 = data1.get("results", [])
-
-    # Call 2: dubbed source languages
-    source_langs = DUBBED_SOURCE_LANGS.get(user_lang, [])
-    results2: list = []
-    data2: dict = {}
-    if source_langs:
-        params2  = {**base_params, "with_original_language": "|".join(source_langs)}
-        data2    = await _tmdb_get("/discover/movie", params2)
-        results2 = data2.get("results", [])
-
-    # Merge — originals come first, then dubbed sources, dedup by id
-    seen: set = set()
-    merged: list = []
-    for m in results1 + results2:
-        if m["id"] not in seen:
-            seen.add(m["id"])
-            merged.append(m)
-
-    # Re-sort merged list by the same field TMDB used
-    sort_key = base_params.get("sort_by", "popularity.desc")
-    field, direction = sort_key.rsplit(".", 1)
-    field_map = {
-        "primary_release_date": "release_date",
-        "popularity":           "popularity",
-        "vote_average":         "vote_average",
-        "revenue":              "revenue",
-    }
-    sort_field = field_map.get(field, "popularity")
-    reverse    = direction == "desc"
-    merged.sort(key=lambda m: m.get(sort_field) or "", reverse=reverse)
-
-    total1 = data1.get("total_results", 0)
-    total2 = data2.get("total_results", 0) if data2 else 0
-    pages1 = data1.get("total_pages", 1)
-    pages2 = data2.get("total_pages", 1) if data2 else 1
-
-    return {
-        "results":       merged[:20],
-        "total_results": total1 + total2,
-        "total_pages":   max(pages1, pages2),
-    }
-
-
 async def _apply_cast_director_filter(filters: dict, params: dict) -> dict:
     people_ids: list = []
     for actor in filters.get("cast", []):
@@ -299,6 +229,239 @@ async def _apply_cast_director_filter(filters: dict, params: dict) -> dict:
     if people_ids:
         params["with_cast"] = ",".join(str(i) for i in people_ids)
     return params
+
+
+# ---------------------------------------------------------------------------
+# Core Search Algorithm
+# ---------------------------------------------------------------------------
+
+def _title_match_score(title: str, query: str) -> float:
+    """
+    Score how well a movie title matches the search query.
+    Returns 0.0 to 1.0 — higher is better match.
+    """
+    title_clean = title.lower().strip()
+    query_clean = query.lower().strip()
+
+    # Exact match
+    if title_clean == query_clean:
+        return 1.0
+
+    # Title starts with query
+    if title_clean.startswith(query_clean):
+        return 0.95
+
+    # Query is contained in title
+    if query_clean in title_clean:
+        return 0.85
+
+    # Word-level overlap score
+    title_words = set(re.split(r'\W+', title_clean))
+    query_words = set(re.split(r'\W+', query_clean))
+    query_words.discard('')
+    title_words.discard('')
+
+    if not query_words:
+        return 0.0
+
+    overlap = len(title_words & query_words) / len(query_words)
+    return overlap * 0.7
+
+
+async def _title_search(
+    title: str,
+    lang_code: Optional[str],
+    page: int,
+    genre_map: dict,
+) -> dict:
+    """
+    MODE 1: Title-based search.
+
+    Strategy:
+    1. /search/movie — text search across ALL languages (finds every version)
+    2. /discover with with_text_query + language filter (language-specific)
+    3. Merge, score by title match + language preference + recency
+    4. Return sorted results with best matches first, all years included
+
+    This ensures "Kushi" returns BOTH the 2023 Telugu AND the 2001 Telugu versions.
+    """
+    results_map: dict = {}   # id → raw movie dict
+    scored: dict = {}        # id → score
+
+    # ── Step 1: Broad text search (all languages, all years) ──────────────
+    try:
+        search_data = await _tmdb_get("/search/movie", {
+            "query":         title,
+            "language":      "en-US",
+            "page":          page,
+            "include_adult": "false",
+        })
+        for m in search_data.get("results", []):
+            mid = m["id"]
+            results_map[mid] = m
+            score = _title_match_score(m.get("title", ""), title)
+            # Boost if original language matches user's preferred language
+            if lang_code and m.get("original_language") == lang_code:
+                score += 0.3
+            # Small recency boost (newer = slightly higher)
+            year_str = (m.get("release_date") or "")[:4]
+            if year_str.isdigit():
+                year_boost = min((int(year_str) - 1990) / 100, 0.1)
+                score += year_boost
+            scored[mid] = score
+
+        total_results = search_data.get("total_results", 0)
+        total_pages   = search_data.get("total_pages", 1)
+
+    except Exception as exc:
+        logger.warning("[title_search] Search call failed: %s", exc)
+        total_results = 0
+        total_pages   = 1
+
+    # ── Step 2: Discover with text query + language filter ────────────────
+    # This finds language-specific results that /search might rank poorly
+    if lang_code:
+        try:
+            discover_data = await _tmdb_get("/discover/movie", {
+                "with_text_query":        title,
+                "with_original_language": lang_code,
+                "sort_by":                "primary_release_date.desc",
+                "include_adult":          "false",
+                "with_release_type":      "1|2|3|4|5|6",
+                "page":                   1,
+            })
+            for m in discover_data.get("results", []):
+                mid = m["id"]
+                if mid not in results_map:
+                    results_map[mid] = m
+                    total_results += 1
+                # Boost language-matched discover results highly
+                base_score = _title_match_score(m.get("title", ""), title)
+                scored[mid] = max(scored.get(mid, 0), base_score + 0.4)
+
+        except Exception as exc:
+            logger.warning("[title_search] Discover+text call failed: %s", exc)
+
+    # ── Step 3: Sort by score descending ─────────────────────────────────
+    sorted_ids = sorted(results_map.keys(), key=lambda i: scored.get(i, 0), reverse=True)
+    sorted_results = [results_map[i] for i in sorted_ids]
+
+    return {
+        "results":       sorted_results,
+        "total_results": total_results,
+        "total_pages":   total_pages,
+    }
+
+
+async def _similar_movie_search(
+    reference_title: str,
+    filters: dict,
+    params: dict,
+    lang_code: Optional[str],
+) -> dict:
+    """
+    MODE 2: Find movies similar to a reference title.
+
+    Strategy:
+    1. Search TMDB for the reference movie to get its genre_ids
+    2. Also use TMDB's /movie/{id}/recommendations endpoint if available
+    3. Combine with /discover using genre filter
+    4. Apply language filter with dubbed sources
+    """
+    try:
+        search_data = await _tmdb_get("/search/movie", {
+            "query":    reference_title,
+            "language": "en-US",
+            "page":     1,
+        })
+        results = search_data.get("results", [])
+        if not results:
+            return await _tmdb_get("/discover/movie", params)
+
+        ref           = results[0]
+        ref_id        = ref["id"]
+        ref_genre_ids = ref.get("genre_ids", [])
+        ref_lang      = ref.get("original_language", "")
+
+        logger.info("[similar] Reference: %s (id=%s, genres=%s, lang=%s)",
+                    ref.get("title"), ref_id, ref_genre_ids, ref_lang)
+
+        # Use reference genres in discover
+        if ref_genre_ids:
+            params["with_genres"] = _build_genre_param(ref_genre_ids, use_and=False)
+
+        # Language: explicit user preference wins over reference language
+        final_lang = lang_code if lang_code else ref_lang
+        if final_lang:
+            params["with_original_language"] = final_lang
+
+        # Override with explicit user genres if provided
+        explicit_ids = _explicit_genre_ids(filters)
+        if explicit_ids:
+            params["with_genres"] = _build_genre_param(explicit_ids, use_and=False)
+
+    except Exception as exc:
+        logger.warning("[similar] Reference lookup failed: %s", exc)
+
+    return await _discover_with_language(params, lang_code)
+
+
+async def _discover_with_language(params: dict, lang_code: Optional[str]) -> dict:
+    """
+    Run discover call(s).
+    If lang_code given: TWO calls (originals + dubbed sources) merged.
+    If no lang_code: single call.
+    """
+    if not lang_code:
+        return await _tmdb_get("/discover/movie", params)
+
+    # Call 1: originals in target language
+    params1  = {**params, "with_original_language": lang_code}
+    data1    = await _tmdb_get("/discover/movie", params1)
+    results1 = data1.get("results", [])
+
+    # Call 2: dubbed source languages
+    source_langs = DUBBED_SOURCE_LANGS.get(lang_code, [])
+    results2: list = []
+    data2: dict    = {}
+    if source_langs:
+        try:
+            params2  = {**params, "with_original_language": "|".join(source_langs)}
+            data2    = await _tmdb_get("/discover/movie", params2)
+            results2 = data2.get("results", [])
+        except Exception as exc:
+            logger.warning("[discover_lang] Dubbed call failed: %s", exc)
+
+    # Merge: originals first, then dubbed, dedup by id
+    seen:   set  = set()
+    merged: list = []
+    for m in results1 + results2:
+        if m["id"] not in seen:
+            seen.add(m["id"])
+            merged.append(m)
+
+    # Re-sort by same field as params sort_by
+    sort_key   = params.get("sort_by", "primary_release_date.desc")
+    field, dir = sort_key.rsplit(".", 1)
+    field_map  = {
+        "primary_release_date": "release_date",
+        "popularity":           "popularity",
+        "vote_average":         "vote_average",
+        "revenue":              "revenue",
+    }
+    sort_field = field_map.get(field, "popularity")
+    merged.sort(key=lambda m: m.get(sort_field) or "", reverse=(dir == "desc"))
+
+    total1 = data1.get("total_results", 0)
+    total2 = data2.get("total_results", 0) if data2 else 0
+    pages1 = data1.get("total_pages", 1)
+    pages2 = data2.get("total_pages", 1) if data2 else 1
+
+    return {
+        "results":       merged[:20],
+        "total_results": total1 + total2,
+        "total_pages":   max(pages1, pages2),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -332,9 +495,9 @@ def _format_movie(raw: dict, genre_map: dict) -> Movie:
 
 @router.get("/recommend", response_model=RecommendResponse)
 async def recommend(
-    q:    str = Query(default="popular movies", description="Free-text movie query"),
+    q:    str = Query(default="popular movies"),
     page: int = Query(default=1, ge=1, le=500),
-    sort: str = Query(default="recent", description="recent|popular|rated|oldest|revenue"),
+    sort: str = Query(default="recent"),
 ):
     sort_by = SORT_OPTIONS.get(sort, SORT_OPTIONS["recent"])
 
@@ -357,108 +520,74 @@ async def recommend(
 
     genre_map = await _fetch_genre_map()
 
+    # Determine explicit language from filters
+    explicit_lang    = _language_code(filters)
+    dubbed_requested = filters.get("dubbed", False)
+    lang_code        = explicit_lang or ("te" if dubbed_requested else None)
+
+    # Base discover params (used in MODE 2 and 3)
+    today = date.today().isoformat()
+    base_params: dict[str, Any] = {
+        "page":              page,
+        "sort_by":           sort_by,
+        "include_adult":     "false",
+        "include_video":     "false",
+        "vote_count.gte":    5,
+        "with_release_type": "1|2|3|4|5|6",
+    }
+    if "era_end" not in filters:
+        base_params["primary_release_date.lte"] = today
+    if "era_start" in filters:
+        base_params["primary_release_date.gte"] = f"{filters['era_start']}-01-01"
+    if "era_end" in filters:
+        base_params["primary_release_date.lte"] = f"{filters['era_end']}-12-31"
+    if "min_rating" in filters:
+        base_params["vote_average.gte"] = filters["min_rating"]
+        base_params["vote_count.gte"]   = 50
+    if filters.get("cast") or filters.get("director"):
+        base_params = await _apply_cast_director_filter(filters, base_params)
+
     try:
-        # Base TMDB params — language is NOT set here, handled separately below
-        params: dict[str, Any] = {
-            "page":            page,
-            "sort_by":         sort_by,
-            "include_adult":   "false",
-            "include_video":   "false",
-            "vote_count.gte":  5,
-            "with_release_type": "1|2|3|4|5|6",
-        }
+        direct_search = filters.get("direct_search", "")
+        similar_to    = filters.get("similar_to", "")
 
-        # No future movies
-        today = date.today().isoformat()
-        if "era_end" not in filters:
-            params["primary_release_date.lte"] = today
-
-        # Era
-        if "era_start" in filters:
-            params["primary_release_date.gte"] = f"{filters['era_start']}-01-01"
-        if "era_end" in filters:
-            params["primary_release_date.lte"] = f"{filters['era_end']}-12-31"
-
-        # Min rating
-        if "min_rating" in filters:
-            params["vote_average.gte"] = filters["min_rating"]
-            params["vote_count.gte"]   = 50
-
-        # Cast / Director
-        if filters.get("cast") or filters.get("director"):
-            params = await _apply_cast_director_filter(filters, params)
-
-        # ── Direct movie title search ─────────────────────────────────────
-        # When user types a movie title (e.g. "Hari Hara Veera Mallu"),
-        # search TMDB for exact match, pin it at top, then show similar movies below
-        direct_search = filters.get("direct_search")
-        exact_movie: Optional[dict] = None
-
+        # ── MODE 1: Direct title search ───────────────────────────────────
         if direct_search:
-            try:
-                search_data    = await _tmdb_get("/search/movie", {
-                    "query": direct_search, "language": "en-US", "page": 1,
-                })
-                search_results = search_data.get("results", [])
-                if search_results:
-                    exact_movie    = search_results[0]
-                    ref_genre_ids  = exact_movie.get("genre_ids", [])
-                    if ref_genre_ids:
-                        params["with_genres"] = _build_genre_param(ref_genre_ids, use_and=False)
-                    logger.info("[recommend] Direct match: %s (id=%s)",
-                                exact_movie.get("title"), exact_movie.get("id"))
-            except Exception as exc:
-                logger.warning("[recommend] Direct search error: %s", exc)
+            logger.info("[recommend] MODE 1 — Title search: %r lang=%s", direct_search, lang_code)
+            tmdb_data = await _title_search(direct_search, lang_code, page, genre_map)
 
-        # ── Genres (non-direct searches) ───────────────────────────────
-        if not direct_search:
+        # ── MODE 2: Similar movies ────────────────────────────────────────
+        elif similar_to:
+            logger.info("[recommend] MODE 2 — Similar to: %r lang=%s", similar_to, lang_code)
+            tmdb_data = await _similar_movie_search(
+                similar_to, filters, base_params.copy(), lang_code
+            )
+
+        # ── MODE 3: Descriptive / genre / mood search ─────────────────────
+        else:
+            logger.info("[recommend] MODE 3 — Descriptive search, lang=%s", lang_code)
             explicit_ids = _explicit_genre_ids(filters)
             mood_ids     = _mood_genre_ids(filters)
-            if "similar_to" in filters:
-                ref_genre_ids, _ref_lang = await _resolve_reference_movie(filters["similar_to"])
-                if explicit_ids:
-                    params["with_genres"] = _build_genre_param(explicit_ids, use_and=False)
-                elif ref_genre_ids:
-                    params["with_genres"] = _build_genre_param(ref_genre_ids, use_and=False)
-            else:
-                if explicit_ids:
-                    params["with_genres"] = _build_genre_param(explicit_ids, use_and=False)
-                elif mood_ids:
-                    params["with_genres"] = _build_genre_param(mood_ids, use_and=False)
+            if explicit_ids:
+                base_params["with_genres"] = _build_genre_param(explicit_ids, use_and=False)
+            elif mood_ids:
+                base_params["with_genres"] = _build_genre_param(mood_ids, use_and=False)
 
-        # ── Language (always last, always wins) ───────────────────────────
-        explicit_lang    = _language_code(filters)
-        dubbed_requested = filters.get("dubbed", False)
-
-        logger.info("[recommend] Final TMDB params (pre-lang): %s", params)
-
-        if explicit_lang:
-            tmdb_data = await _fetch_with_language(params, explicit_lang)
-        elif dubbed_requested:
-            tmdb_data = await _fetch_with_language(params, "te")
-        else:
-            tmdb_data = await _tmdb_get("/discover/movie", params)
+            tmdb_data = await _discover_with_language(base_params, lang_code)
 
     except HTTPException:
         raise
     except Exception as exc:
-        logger.error("[recommend] TMDB fetch failed: %s", exc)
+        logger.error("[recommend] Failed: %s", exc)
         raise HTTPException(status_code=502, detail="Failed to fetch movies from TMDB.")
 
-    # 4. Format
+    # 4. Format results — NO local language filtering (TMDB handles it)
     raw_results   = tmdb_data.get("results", [])
     total_results = tmdb_data.get("total_results", len(raw_results))
     total_pages   = tmdb_data.get("total_pages", 1)
+    movies        = [_format_movie(r, genre_map) for r in raw_results]
 
-    # Pin exact movie at top, remove it from discover results to avoid duplicate
-    if exact_movie:
-        exact_id  = exact_movie["id"]
-        raw_results = [r for r in raw_results if r["id"] != exact_id]
-        raw_results = [exact_movie] + raw_results  # exact match first!
-
-    movies = [_format_movie(r, genre_map) for r in raw_results]
-
-    # Local post-filter (belt-and-suspenders)
+    # Local post-filter for rating/era only
     min_rating = filters.get("min_rating")
     era_start  = filters.get("era_start")
     era_end    = filters.get("era_end")
